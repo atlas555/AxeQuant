@@ -4,9 +4,11 @@ User Management API Routes
 Provides endpoints for user CRUD operations, role management, etc.
 Only accessible by admin users.
 """
+import csv
 import json
+from io import StringIO
 import re
-from flask import Blueprint, request, jsonify, g
+from flask import Blueprint, request, jsonify, g, Response
 from app.services.user_service import get_user_service
 from app.utils.auth import login_required, admin_required
 from app.utils.db import get_db_connection
@@ -63,6 +65,54 @@ def list_users():
         })
     except Exception as e:
         logger.error(f"list_users failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/export', methods=['GET'])
+@login_required
+@admin_required
+def export_users():
+    """Export all users as an Excel-friendly CSV file (admin only)."""
+    try:
+        search = request.args.get('search', '', type=str)
+        users = get_user_service().list_all_users_for_export(search=search)
+
+        output = StringIO()
+        output.write('\ufeff')
+        writer = csv.writer(output)
+        writer.writerow([
+            'ID', 'Username', 'Email', 'Nickname', 'Role', 'Status',
+            'Credits', 'VIP Expires At', 'Timezone', 'Register IP',
+            'Last Login At', 'Created At', 'Updated At'
+        ])
+
+        for user in users:
+            writer.writerow([
+                user.get('id') or '',
+                user.get('username') or '',
+                user.get('email') or '',
+                user.get('nickname') or '',
+                user.get('role') or '',
+                user.get('status') or '',
+                user.get('credits') or 0,
+                user.get('vip_expires_at') or '',
+                user.get('timezone') or '',
+                user.get('register_ip') or '',
+                user.get('last_login_at') or '',
+                user.get('created_at') or '',
+                user.get('updated_at') or '',
+            ])
+
+        filename = 'quantdinger_users_export.csv'
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv; charset=utf-8',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"'
+            }
+        )
+    except Exception as e:
+        logger.error(f"export_users failed: {e}", exc_info=True)
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
@@ -1167,6 +1217,7 @@ def get_system_strategies():
                     s.user_id,
                     s.strategy_name,
                     s.strategy_type,
+                    s.strategy_mode,
                     s.market_category,
                     s.execution_mode,
                     s.status,
@@ -1250,6 +1301,16 @@ def get_system_strategies():
             indicator_name = ''
             if isinstance(indicator_config, dict):
                 indicator_name = indicator_config.get('indicator_name') or indicator_config.get('name') or ''
+            if not indicator_name and str(s.get('strategy_mode') or '').strip().lower() == 'bot':
+                if isinstance(trading_config, dict):
+                    indicator_name = (
+                        trading_config.get('bot_name')
+                        or s.get('strategy_name')
+                        or trading_config.get('bot_type')
+                        or ''
+                    )
+                else:
+                    indicator_name = s.get('strategy_name') or ''
 
             # Extract exchange name
             exchange_name = ''

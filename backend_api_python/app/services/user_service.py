@@ -594,6 +594,64 @@ class UserService:
         except Exception as e:
             logger.error(f"list_users failed: {e}")
             return {'items': [], 'total': 0, 'page': 1, 'page_size': page_size, 'total_pages': 0}
+
+    def list_all_users_for_export(self, search: str = None) -> List[Dict[str, Any]]:
+        """List all users for export with the same fields as the admin user table."""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+
+                where_clause = ""
+                params = []
+                if search and search.strip():
+                    search_term = f"%{search.strip()}%"
+                    where_clause = "WHERE username LIKE ? OR email LIKE ? OR nickname LIKE ?"
+                    params = [search_term, search_term, search_term]
+
+                query_sql = f"""
+                    SELECT id, username, email, nickname, avatar, status, role,
+                           credits, vip_expires_at, timezone,
+                           COALESCE(
+                               qd_users.last_login_at,
+                               (
+                                   SELECT MAX(sl.created_at)
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('login_success', 'login_via_code', 'oauth_login')
+                               )
+                           ) AS last_login_at,
+                           COALESCE(
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('register', 'register_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               ),
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('oauth_login', 'login_success', 'login_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               )
+                           ) AS register_ip,
+                           created_at, updated_at
+                    FROM qd_users
+                    {where_clause}
+                    ORDER BY id DESC
+                """
+                cur.execute(query_sql, tuple(params))
+                users = cur.fetchall() or []
+                cur.close()
+                return users
+        except Exception as e:
+            logger.error(f"list_all_users_for_export failed: {e}")
+            return []
     
     def get_user_permissions(self, role: str) -> List[str]:
         """Get permissions for a role"""

@@ -133,19 +133,47 @@ def _strategy_debug_summary(validation: dict | None = None) -> dict:
     }
 
 
-def _strategy_hint_to_text(hint_code: str, params: dict | None = None) -> str:
+def _request_lang(default: str = "zh-CN") -> str:
+    raw = (
+        request.headers.get("X-App-Lang")
+        or request.headers.get("Accept-Language")
+        or default
+    )
+    lang = str(raw or default).split(",", 1)[0].strip()
+    return lang or default
+
+
+def _is_zh_lang(lang: str | None) -> bool:
+    return str(lang or "zh-CN").strip().lower().startswith("zh")
+
+
+def _strategy_ai_text(key: str, lang: str = "zh-CN") -> str:
+    is_zh = _is_zh_lang(lang)
+    texts = {
+        "prompt_empty": "提示词不能为空" if is_zh else "Prompt cannot be empty",
+        "no_llm_key": "未配置 LLM API Key" if is_zh else "No LLM API key configured",
+        "insufficient_credits": "积分不足，请充值后重试" if is_zh else "Insufficient credits. Please top up and try again.",
+        "invalid_json_params": "AI 未返回有效的 JSON 参数" if is_zh else "AI did not return valid JSON parameters",
+        "ai_empty_result": "AI 生成结果为空" if is_zh else "AI generation returned empty result",
+        "success": "success",
+    }
+    return texts.get(key, key)
+
+
+def _strategy_hint_to_text(hint_code: str, params: dict | None = None, lang: str = "zh-CN") -> str:
     _ = params or {}
+    is_zh = _is_zh_lang(lang)
     if hint_code == 'MISSING_ON_INIT':
-        return "缺少 on_init(ctx) 函数。"
+        return "缺少 on_init(ctx) 函数。" if is_zh else "Missing on_init(ctx) function."
     if hint_code == 'MISSING_ON_BAR':
-        return "缺少 on_bar(ctx, bar) 函数。"
+        return "缺少 on_bar(ctx, bar) 函数。" if is_zh else "Missing on_bar(ctx, bar) function."
     if hint_code == 'NO_CTX_PARAM_DEFAULTS':
-        return "没有通过 ctx.param(...) 声明参数默认值。"
+        return "没有通过 ctx.param(...) 声明参数默认值。" if is_zh else "No parameter defaults were declared via ctx.param(...)."
     if hint_code == 'NO_ORDER_INTENT':
-        return "没有检测到 ctx.buy / ctx.sell / ctx.close_position 等交易动作。"
+        return "没有检测到 ctx.buy / ctx.sell / ctx.close_position 等交易动作。" if is_zh else "No order intent like ctx.buy / ctx.sell / ctx.close_position was detected."
     if hint_code == 'EMPTY_CODE':
-        return "策略代码为空。"
-    return f"检测到策略提示：{hint_code}"
+        return "策略代码为空。" if is_zh else "Strategy code is empty."
+    return f"检测到策略提示：{hint_code}" if is_zh else f"Strategy hint detected: {hint_code}"
 
 
 def _strategy_human_summary(
@@ -154,7 +182,9 @@ def _strategy_human_summary(
     auto_fix_applied: bool,
     auto_fix_succeeded: bool,
     returned_candidate: str,
+    lang: str = "zh-CN",
 ) -> dict:
+    is_zh = _is_zh_lang(lang)
     initial_hints = initial_validation.get('hints') or []
     final_hints = final_validation.get('hints') or []
     initial_codes = {h.get('code') for h in initial_hints if h.get('code')}
@@ -163,24 +193,32 @@ def _strategy_human_summary(
     remaining_codes = sorted(final_codes)
 
     fixed_messages = [
-        _strategy_hint_to_text(h.get('code'), h.get('params'))
+        _strategy_hint_to_text(h.get('code'), h.get('params'), lang=lang)
         for h in initial_hints
         if h.get('code') in fixed_codes
     ]
     remaining_messages = [
-        _strategy_hint_to_text(h.get('code'), h.get('params'))
+        _strategy_hint_to_text(h.get('code'), h.get('params'), lang=lang)
         for h in final_hints
         if h.get('code') in remaining_codes
     ]
 
     if auto_fix_applied and auto_fix_succeeded:
-        title = "AI 已自动修复并返回更稳定的策略代码"
+        title = "AI 已自动修复并返回更稳定的策略代码" if is_zh else "AI auto-fixed the strategy code and returned a more stable version"
     elif auto_fix_applied:
-        title = "AI 尝试自动修复策略代码，但仍保留部分问题"
+        title = "AI 尝试自动修复策略代码，但仍保留部分问题" if is_zh else "AI attempted to auto-fix the strategy code, but some issues still remain"
     else:
-        title = "AI 已生成策略代码，并通过当前质检流程"
+        title = "AI 已生成策略代码，并通过当前质检流程" if is_zh else "AI generated strategy code and it passed the current QA flow"
 
-    returned_text = "当前返回的是自动修复后的代码。" if returned_candidate == 'repaired' else "当前返回的是首次生成的代码。"
+    returned_text = (
+        "当前返回的是自动修复后的代码。"
+        if returned_candidate == 'repaired' and is_zh else
+        "The returned code is the auto-fixed version."
+        if returned_candidate == 'repaired' else
+        "当前返回的是首次生成的代码。"
+        if is_zh else
+        "The returned code is the initially generated version."
+    )
     return {
         "title": title,
         "returned_text": returned_text,
@@ -1466,16 +1504,17 @@ def ai_generate_strategy():
     """Generate strategy code or suggest template parameter updates using AI."""
     try:
         payload = request.get_json() or {}
+        lang = _request_lang()
         prompt = payload.get('prompt', '')
         if not prompt.strip():
-            return jsonify({'code': '', 'msg': 'Prompt is empty', 'params': None})
+            return jsonify({'code': '', 'msg': _strategy_ai_text('prompt_empty', lang), 'params': None})
 
         intent = (payload.get('intent') or 'generate_code').strip()
         from app.services.llm import LLMService
         llm = LLMService()
         api_key = llm.get_api_key()
         if not api_key:
-            return jsonify({'code': '', 'msg': 'No LLM API key configured', 'params': None})
+            return jsonify({'code': '', 'msg': _strategy_ai_text('no_llm_key', lang), 'params': None})
 
         from app.services.billing_service import get_billing_service
         billing = get_billing_service()
@@ -1486,7 +1525,8 @@ def ai_generate_strategy():
             reference_id=f"ai_strategy_{intent}_{user_id}_{int(time.time())}"
         )
         if not ok:
-            return jsonify({'code': '', 'msg': f'积分不足: {billing_msg}', 'params': None})
+            msg = f'积分不足: {billing_msg}' if _is_zh_lang(lang) and billing_msg else _strategy_ai_text('insufficient_credits', lang)
+            return jsonify({'code': '', 'msg': msg, 'params': None})
 
         if intent == 'bot_recommend':
             # ── Extract symbol from user prompt and fetch real market data ──
@@ -1681,8 +1721,8 @@ Do not use markdown fences, do not add explanations before or after the JSON."""
                     except json.JSONDecodeError:
                         updates = None
             if not isinstance(updates, dict):
-                return jsonify({'code': '', 'params': None, 'msg': 'AI did not return valid JSON parameters'})
-            return jsonify({'code': '', 'params': updates, 'msg': 'success'})
+                return jsonify({'code': '', 'params': None, 'msg': _strategy_ai_text('invalid_json_params', lang)})
+            return jsonify({'code': '', 'params': updates, 'msg': _strategy_ai_text('success', lang)})
 
         system_prompt = """You are a quantitative trading strategy code generator.
 Generate Python strategy code that follows this framework:
@@ -1810,7 +1850,7 @@ Quality rules:
             'initial_validation': _strategy_debug_summary(validation),
             'final_validation': _strategy_debug_summary(validation),
         }
-        debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial')
+        debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial', lang=lang)
 
         if _needs_auto_fix_strategy(validation):
             logger.warning("ai_generate_strategy produced code needing auto-fix: %s", _format_strategy_validation_issues(validation))
@@ -1829,7 +1869,8 @@ Quality rules:
                     repaired_validation,
                     True,
                     repaired_validation.get('success', False),
-                    'repaired' if repaired_validation.get('success') else 'initial'
+                    'repaired' if repaired_validation.get('success') else 'initial',
+                    lang=lang
                 )
                 logger.info("ai_generate_strategy debug=%s", json.dumps(debug, ensure_ascii=False))
                 if repaired_validation.get('success'):
@@ -1845,16 +1886,16 @@ Quality rules:
                     'final_validation': _strategy_debug_summary(validation),
                     'auto_fix_error': str(repair_err),
                 }
-                debug['human_summary'] = _strategy_human_summary(validation, validation, True, False, 'initial')
+                debug['human_summary'] = _strategy_human_summary(validation, validation, True, False, 'initial', lang=lang)
                 logger.error("ai_generate_strategy auto-fix failed: %s", repair_err)
         else:
-            debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial')
+            debug['human_summary'] = _strategy_human_summary(validation, validation, False, False, 'initial', lang=lang)
             logger.info("ai_generate_strategy debug=%s", json.dumps(debug, ensure_ascii=False))
 
         if content:
-            return jsonify({'code': content, 'msg': 'success', 'params': None, 'debug': debug})
+            return jsonify({'code': content, 'msg': _strategy_ai_text('success', lang), 'params': None, 'debug': debug})
         else:
-            return jsonify({'code': '', 'msg': 'AI generation returned empty result', 'params': None, 'debug': debug})
+            return jsonify({'code': '', 'msg': _strategy_ai_text('ai_empty_result', lang), 'params': None, 'debug': debug})
     except Exception as e:
         logger.error(f"ai_generate_strategy failed: {str(e)}")
         return jsonify({'code': '', 'msg': str(e), 'params': None, 'debug': None})

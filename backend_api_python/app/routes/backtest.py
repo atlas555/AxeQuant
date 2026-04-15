@@ -3,6 +3,7 @@ Backtest API routes
 """
 from flask import Blueprint, request, jsonify, g
 from datetime import datetime
+import calendar
 import traceback
 import json
 import time
@@ -18,6 +19,27 @@ logger = get_logger(__name__)
 
 backtest_bp = Blueprint('backtest', __name__)
 backtest_service = BacktestService()
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Add calendar months while keeping the day within the target month."""
+    month_index = (dt.month - 1) + int(months or 0)
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _backtest_range_limit(timeframe: str, start_date: datetime) -> tuple[datetime, str]:
+    """Return the max allowed end date and human-readable label for a timeframe."""
+    tf = str(timeframe or '').strip()
+    if tf == '1m':
+        return _add_months(start_date, 1), '1 month'
+    if tf == '5m':
+        return _add_months(start_date, 6), '6 months'
+    if tf in ['15m', '30m']:
+        return _add_months(start_date, 12), '1 year'
+    return _add_months(start_date, 36), '3 years'
 
 
 def _openrouter_base_and_key() -> tuple[str, str]:
@@ -205,22 +227,11 @@ def run_backtest():
         
         # 验证时间范围限制
         days_diff = (end_date - start_date).days
+        max_end_date, max_range_text = _backtest_range_limit(timeframe, start_date)
+        max_end_date = max_end_date.replace(hour=23, minute=59, second=59)
         
-        # 根据周期设置不同的时间限制
-        if timeframe == '1m':
-            max_days = 30  # 1分钟K线最多1个月
-            max_range_text = '1 month'
-        elif timeframe == '5m':
-            max_days = 180  # 5分钟K线最多6个月
-            max_range_text = '6 months'
-        elif timeframe in ['15m', '30m']:
-            max_days = 365  # 15分钟和30分钟K线最多1年
-            max_range_text = '1 year'
-        else:  # 1H, 4H, 1D, 1W
-            max_days = 1095  # 1小时及以上最多3年
-            max_range_text = '3 years'
-        
-        if days_diff > max_days:
+        if end_date > max_end_date:
+            max_days = (max_end_date - start_date).days
             return jsonify({
                 'code': 0,
                 'msg': f'Backtest range exceeds limit: timeframe {timeframe} supports up to {max_range_text} ({max_days} days), but you selected {days_diff} days',

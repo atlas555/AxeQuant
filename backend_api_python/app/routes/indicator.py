@@ -291,35 +291,74 @@ def _indicator_debug_summary(validation: Dict[str, Any] | None = None) -> Dict[s
     }
 
 
-def _indicator_hint_to_text(hint_code: str, params: Dict[str, Any] | None = None) -> str:
+def _request_lang(default: str = "zh-CN") -> str:
+    raw = (
+        request.headers.get("X-App-Lang")
+        or request.headers.get("Accept-Language")
+        or default
+    )
+    lang = str(raw or default).split(",", 1)[0].strip()
+    return lang or default
+
+
+def _is_zh_lang(lang: str | None) -> bool:
+    return str(lang or "zh-CN").strip().lower().startswith("zh")
+
+
+def _indicator_ai_text(key: str, lang: str = "zh-CN") -> str:
+    is_zh = _is_zh_lang(lang)
+    texts = {
+        "prompt_required": "提示词不能为空" if is_zh else "Prompt cannot be empty",
+        "insufficient_credits": "积分不足，请充值后重试" if is_zh else "Insufficient credits. Please top up and try again.",
+    }
+    return texts.get(key, key)
+
+
+def _indicator_hint_to_text(hint_code: str, params: Dict[str, Any] | None = None, lang: str = "zh-CN") -> str:
     params = params or {}
+    is_zh = _is_zh_lang(lang)
     if hint_code == "DECLARED_PARAMS_NOT_READ_VIA_PARAMS_GET":
         names = params.get("names") or []
-        joined = "、".join(names) if names else "参数"
-        return f"已检测到声明的参数未通过 params.get(...) 读取：{joined}。"
+        joined = "、".join(names) if (names and is_zh) else ", ".join(names)
+        if not joined:
+            joined = "参数" if is_zh else "parameters"
+        return (
+            f"已检测到声明的参数未通过 params.get(...) 读取：{joined}。"
+            if is_zh else
+            f"Declared parameters are not being read via params.get(...): {joined}."
+        )
     if hint_code == "SIGNAL_MARKERS_USE_WHERE_NONE":
-        return "已检测到信号标记使用 where(..., None).tolist()，建议改为显式 None 列表以避免 NaN 渲染问题。"
+        return (
+            "已检测到信号标记使用 where(..., None).tolist()，建议改为显式 None 列表以避免 NaN 渲染问题。"
+            if is_zh else
+            "Signal markers use where(..., None).tolist(); prefer an explicit None list to avoid NaN rendering issues."
+        )
     if hint_code == "MISSING_OUTPUT":
-        return "缺少 output 字典。"
+        return "缺少 output 字典。" if is_zh else "Missing output dictionary."
     if hint_code == "MISSING_BUY_SELL_COLUMNS":
-        return "缺少 df['buy'] 或 df['sell'] 信号列。"
+        return "缺少 df['buy'] 或 df['sell'] 信号列。" if is_zh else "Missing df['buy'] or df['sell'] signal columns."
     if hint_code == "MISSING_DF_COPY":
-        return "缺少 df = df.copy()。"
+        return "缺少 df = df.copy()。" if is_zh else "Missing df = df.copy()."
     if hint_code == "MISSING_INDICATOR_NAME":
-        return "缺少 my_indicator_name。"
+        return "缺少 my_indicator_name。" if is_zh else "Missing my_indicator_name."
     if hint_code == "MISSING_INDICATOR_DESCRIPTION":
-        return "缺少 my_indicator_description。"
+        return "缺少 my_indicator_description。" if is_zh else "Missing my_indicator_description."
     if hint_code == "UNKNOWN_STRATEGY_KEY":
-        return f"存在未知的 @strategy 键：{params.get('key') or 'unknown'}。"
+        key = params.get('key') or 'unknown'
+        return (
+            f"存在未知的 @strategy 键：{key}。"
+            if is_zh else
+            f"Unknown @strategy key detected: {key}."
+        )
     if hint_code == "NO_STRATEGY_ANNOTATIONS":
-        return "没有声明任何 @strategy 默认配置。"
+        return "没有声明任何 @strategy 默认配置。" if is_zh else "No @strategy default configuration was declared."
     if hint_code == "NO_STOP_AND_TAKE_PROFIT":
-        return "未声明止损和止盈默认配置。"
+        return "未声明止损和止盈默认配置。" if is_zh else "Stop-loss and take-profit defaults are not declared."
     if hint_code == "NO_STOP_LOSS":
-        return "未声明止损默认配置。"
+        return "未声明止损默认配置。" if is_zh else "Stop-loss default is not declared."
     if hint_code == "NO_TAKE_PROFIT":
-        return "未声明止盈默认配置。"
-    return f"检测到代码提示：{hint_code}"
+        return "未声明止盈默认配置。" if is_zh else "Take-profit default is not declared."
+    return f"检测到代码提示：{hint_code}" if is_zh else f"Code hint detected: {hint_code}"
 
 
 def _indicator_human_summary(
@@ -328,7 +367,9 @@ def _indicator_human_summary(
     auto_fix_applied: bool,
     auto_fix_succeeded: bool,
     returned_candidate: str,
+    lang: str = "zh-CN",
 ) -> Dict[str, Any]:
+    is_zh = _is_zh_lang(lang)
     initial_hints = initial_validation.get("hints") or []
     final_hints = final_validation.get("hints") or []
     initial_codes = {h.get("code") for h in initial_hints if h.get("code")}
@@ -337,27 +378,27 @@ def _indicator_human_summary(
     remaining_codes = sorted(final_codes)
 
     fixed_messages = [
-        _indicator_hint_to_text(h.get("code"), h.get("params"))
+        _indicator_hint_to_text(h.get("code"), h.get("params"), lang=lang)
         for h in initial_hints
         if h.get("code") in fixed_codes
     ]
     remaining_messages = [
-        _indicator_hint_to_text(h.get("code"), h.get("params"))
+        _indicator_hint_to_text(h.get("code"), h.get("params"), lang=lang)
         for h in final_hints
         if h.get("code") in remaining_codes
     ]
 
     if auto_fix_applied and auto_fix_succeeded:
-        title = "AI 已自动修复并返回更稳定的指标代码"
+        title = "AI 已自动修复并返回更稳定的指标代码" if is_zh else "AI auto-fixed the indicator code and returned a more stable version"
     elif auto_fix_applied:
-        title = "AI 尝试自动修复，但仍保留部分问题"
+        title = "AI 尝试自动修复，但仍保留部分问题" if is_zh else "AI attempted to auto-fix the code, but some issues still remain"
     else:
-        title = "AI 已生成指标代码，并通过当前质检流程"
+        title = "AI 已生成指标代码，并通过当前质检流程" if is_zh else "AI generated indicator code and it passed the current QA flow"
 
     if returned_candidate == "repaired":
-        returned_text = "当前返回的是自动修复后的代码。"
+        returned_text = "当前返回的是自动修复后的代码。" if is_zh else "The returned code is the auto-fixed version."
     else:
-        returned_text = "当前返回的是首次生成的代码。"
+        returned_text = "当前返回的是首次生成的代码。" if is_zh else "The returned code is the initially generated version."
 
     return {
         "title": title,
@@ -687,13 +728,14 @@ def ai_generate():
     Local-first: if OpenRouter key is not configured, we return a reasonable template.
     """
     data = request.get_json() or {}
+    lang = _request_lang()
     prompt = (data.get("prompt") or "").strip()
     existing = (data.get("existingCode") or "").strip()
 
     if not prompt:
         # Keep SSE contract (match PHP behavior) so frontend doesn't look "stuck".
         def _err_stream():
-            yield "data: " + json.dumps({"error": "提示词不能为空"}, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({"error": _indicator_ai_text("prompt_required", lang)}, ensure_ascii=False) + "\n\n"
             yield "data: [DONE]\n\n"
 
         return Response(
@@ -1019,7 +1061,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 "final_validation": _indicator_debug_summary(validation),
             }
             debug["human_summary"] = _indicator_human_summary(
-                validation, validation, False, False, "initial"
+                validation, validation, False, False, "initial", lang=lang
             )
             logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
             return code_text, debug
@@ -1038,7 +1080,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 "auto_fix_error": str(e),
             }
             debug["human_summary"] = _indicator_human_summary(
-                validation, validation, True, False, "initial"
+                validation, validation, True, False, "initial", lang=lang
             )
             logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
             return code_text, debug
@@ -1054,7 +1096,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 "final_validation": _indicator_debug_summary(repaired_validation),
             }
             debug["human_summary"] = _indicator_human_summary(
-                validation, repaired_validation, True, True, "repaired"
+                validation, repaired_validation, True, True, "repaired", lang=lang
             )
             logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
             return repaired, debug
@@ -1070,7 +1112,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 "final_validation": _indicator_debug_summary(repaired_validation),
             }
             debug["human_summary"] = _indicator_human_summary(
-                validation, repaired_validation, True, True, "repaired"
+                validation, repaired_validation, True, True, "repaired", lang=lang
             )
             logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
             return repaired, debug
@@ -1085,7 +1127,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
                 "final_validation": _indicator_debug_summary(repaired_validation),
             }
             debug["human_summary"] = _indicator_human_summary(
-                validation, repaired_validation, True, False, "initial"
+                validation, repaired_validation, True, False, "initial", lang=lang
             )
             logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
             return code_text, debug
@@ -1098,7 +1140,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             "final_validation": _indicator_debug_summary(repaired_validation),
         }
         debug["human_summary"] = _indicator_human_summary(
-            validation, repaired_validation, True, False, "repaired"
+            validation, repaired_validation, True, False, "repaired", lang=lang
         )
         logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
         return repaired, debug
@@ -1114,7 +1156,8 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             reference_id=f"ai_code_gen_{user_id}_{int(time.time())}"
         )
         if not ok:
-            yield "data: " + json.dumps({"error": f"积分不足: {msg}"}, ensure_ascii=False) + "\n\n"
+            error_msg = f"积分不足: {msg}" if _is_zh_lang(lang) and msg else _indicator_ai_text("insufficient_credits", lang)
+            yield "data: " + json.dumps({"error": error_msg}, ensure_ascii=False) + "\n\n"
             yield "data: [DONE]\n\n"
             return
 
