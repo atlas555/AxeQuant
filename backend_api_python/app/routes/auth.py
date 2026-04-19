@@ -6,7 +6,7 @@ Supports both multi-user (database) and single-user (legacy) modes.
 """
 import os
 from flask import Blueprint, request, jsonify, g, redirect
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from app.config.settings import Config
 from app.utils.auth import generate_token, login_required, authenticate_legacy
 from app.utils.logger import get_logger
@@ -17,24 +17,74 @@ auth_bp = Blueprint('auth', __name__)
 
 def _build_frontend_login_redirect(frontend_url: str, **params) -> str:
     """
-    Build a redirect URL to frontend login page for OAuth flows.
+    Build a redirect URL to the frontend login page for OAuth flows.
 
-    Frontend uses Vue Router hash mode (`/#/user/login`), so redirecting to `/user/login`
-    will 404 on static hosting. Always normalize to `{origin}/#/user/login`.
+    Supports both:
+    - PC (hash mode, path `/#/user/login`) — default behavior when only an origin
+      is supplied via FRONTEND_URL.
+    - Mobile / SPA history mode (e.g. `https://m.example.com/login`) — when the
+      caller provides a full URL with a real path (and optional query/hash), we
+      preserve that path instead of overwriting it with `/#/user/login`.
+
+    The decision rule:
+    1. If `frontend_url` contains a hash fragment (starts with `#/`), treat it as
+       a PC hash-mode URL and normalize to `{origin}/#/user/login`.
+    2. If `frontend_url` has a path other than `/` or empty, preserve the full
+       URL (origin + path) and just append the OAuth params as query string.
+    3. Otherwise (origin only), fall back to PC `/#/user/login`.
     """
     base = (frontend_url or '').strip().rstrip('/')
     if not base:
         base = 'http://localhost:8080'
 
-    if '/#/' in base:
-        origin = base.split('/#/', 1)[0].rstrip('/')
-    elif '#' in base:
-        origin = base.split('#', 1)[0].rstrip('/')
+    # Ensure we can parse the URL
+    candidate = base if '://' in base else f'https://{base}'
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        parsed = None
+
+    origin = ''
+    has_real_path = False
+    has_hash_route = False
+
+    if parsed and parsed.scheme and parsed.netloc:
+        origin = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+        # Hash-mode PC login URL, e.g. https://pc.example.com/#/user/login
+        if parsed.fragment:
+            has_hash_route = True
+        path_part = (parsed.path or '').rstrip('/')
+        if path_part and path_part != '':
+            has_real_path = True
     else:
         origin = base
 
+    clean_params = {k: v for k, v in params.items() if v is not None and v != ''}
+    qs = urlencode(clean_params)
+
+    if has_hash_route:
+        # PC / hash-mode: always normalize to /#/user/login
+        login_url = f"{origin}/#/user/login"
+        return f"{login_url}?{qs}" if qs else login_url
+
+    if has_real_path:
+        # SPA history-mode (mobile etc.) — keep the caller-provided path and
+        # merge OAuth params into existing query string.
+        existing_qs = dict(parse_qsl(parsed.query or '', keep_blank_values=True))
+        existing_qs.update(clean_params)
+        merged_qs = urlencode(existing_qs)
+        rebuilt = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            merged_qs,
+            ''  # drop the fragment deliberately for history-mode SPAs
+        ))
+        return rebuilt
+
+    # Origin only — fall back to PC hash route for backward compatibility
     login_url = f"{origin}/#/user/login"
-    qs = urlencode({k: v for k, v in params.items() if v is not None and v != ''})
     return f"{login_url}?{qs}" if qs else login_url
 
 

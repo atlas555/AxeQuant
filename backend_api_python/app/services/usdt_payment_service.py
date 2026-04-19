@@ -1,10 +1,7 @@
 """
 USDT Payment Service (方案B：每单独立地址 + 自动对账)
 
-MVP:
-- 只支持 USDT-TRC20
-- 使用 XPUB 派生地址（服务端只保存 xpub，不保存私钥）
-- 后台 Worker 线程自动轮询链上到账 + 前端轮询双保险
+MVP: USDT-TRC20（TronGrid），watch-only xpub 派生地址。
 """
 
 import os
@@ -39,6 +36,9 @@ class UsdtPaymentService:
             "usdt_trc20_contract": (os.getenv("USDT_TRC20_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t") or "").strip(),
             "confirm_seconds": int(float(os.getenv("USDT_PAY_CONFIRM_SECONDS", "30") or 30)),
             "order_expire_minutes": int(float(os.getenv("USDT_PAY_EXPIRE_MINUTES", "30") or 30)),
+            "debug_reconcile_log": str(os.getenv("USDT_PAY_DEBUG_LOG", "true")).lower() in ("1", "true", "yes"),
+            "trongrid_page_limit": min(200, max(1, int(float(os.getenv("USDT_TRONGRID_PAGE_LIMIT", "200") or 200)))),
+            "trongrid_max_pages": max(1, min(20, int(float(os.getenv("USDT_TRONGRID_MAX_PAGES", "5") or 5)))),
         }
 
     # -------------------- Schema --------------------
@@ -139,7 +139,6 @@ class UsdtPaymentService:
                 cur = db.cursor()
                 self._ensure_schema_best_effort(cur)
 
-                # allocate next address index (simple monotonic)
                 cur.execute(
                     "SELECT COALESCE(MAX(address_index), -1) as max_idx FROM qd_usdt_orders WHERE chain = 'TRC20'"
                 )
@@ -155,7 +154,7 @@ class UsdtPaymentService:
                     VALUES (?, ?, 'TRC20', ?, ?, ?, 'pending', ?, NOW(), NOW())
                     RETURNING id
                     """,
-                    (user_id, plan, float(amount), next_idx, address, expires_at),
+                    (user_id, plan, amount, next_idx, address, expires_at),
                 )
                 row = cur.fetchone() or {}
                 order_id = row.get("id")
@@ -195,6 +194,12 @@ class UsdtPaymentService:
                     return False, "order_not_found", {}
 
                 if refresh:
+                    logger.info(
+                        "USDT get_order refresh order_id=%s user_id=%s status=%s",
+                        order_id,
+                        user_id,
+                        (row.get("status") or ""),
+                    )
                     self._refresh_order_in_tx(cur, row)
                     db.commit()
                     # re-read
@@ -215,6 +220,24 @@ class UsdtPaymentService:
         except Exception as e:
             logger.error(f"get_order failed: {e}", exc_info=True)
             return False, f"error:{str(e)}", {}
+
+    @staticmethod
+    def _coerce_utc_datetime(val: Any) -> Optional[datetime]:
+        """Parse DB/driver timestamps (datetime or ISO str) to timezone-aware UTC."""
+        if val is None:
+            return None
+        if isinstance(val, datetime):
+            dt = val
+        elif isinstance(val, str):
+            try:
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        else:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
     def _row_to_dict(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -239,26 +262,24 @@ class UsdtPaymentService:
         status = (row.get("status") or "").lower()
         chain = (row.get("chain") or "").upper()
         order_id = row.get("id")
-
-        # --- Expiry check (only for pending; paid orders should still be confirmed) ---
-        expires_at = row.get("expires_at")
         now = datetime.now(timezone.utc)
-        if expires_at and isinstance(expires_at, datetime):
-            exp = expires_at
-            if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=timezone.utc)
-            if status == "pending" and exp <= now:
-                cur.execute("UPDATE qd_usdt_orders SET status = 'expired', updated_at = NOW() WHERE id = ?", (order_id,))
-                return
 
         if chain != "TRC20":
+            logger.info("USDT refresh skip order_id=%s reason=unsupported_chain chain=%s", order_id, chain)
             return
-        if status not in ("pending", "paid"):
+        if status not in ("pending", "paid", "expired"):
+            logger.info("USDT refresh skip order_id=%s reason=bad_status status=%s", order_id, status)
             return
 
         address = row.get("address") or ""
         amount = Decimal(str(row.get("amount_usdt") or 0))
         if not address or amount <= 0:
+            logger.info(
+                "USDT refresh skip order_id=%s reason=bad_address_or_amount has_address=%s amount=%s",
+                order_id,
+                bool(address),
+                amount,
+            )
             return
 
         # --- For 'paid' status, skip chain query and just check confirm delay ---
@@ -266,30 +287,69 @@ class UsdtPaymentService:
             self._try_confirm_paid_order(cur, row, cfg, now)
             return
 
-        # --- For 'pending' status, query chain for incoming transfer ---
-        tx = self._find_trc20_usdt_incoming(address, amount, row.get("created_at"))
-        if not tx:
+        # --- pending / expired: match historical TRC20 transfers (balance irrelevant) ---
+        tx, chain_note = self._find_trc20_usdt_incoming(address, amount, row.get("created_at"))
+        if not tx and chain_note and (
+            chain_note.startswith("trongrid_http=") or chain_note.startswith("trongrid_request_error:")
+        ):
+            logger.warning("USDT reconcile TronGrid error order_id=%s user_id=%s %s", order_id, row.get("user_id"), chain_note)
+        if cfg.get("debug_reconcile_log"):
+            logger.info(
+                "USDT reconcile scan order_id=%s user_id=%s status=%s amount=%s addr=%s expires_at=%s note=%s",
+                order_id,
+                row.get("user_id"),
+                status,
+                amount,
+                address,
+                row.get("expires_at"),
+                chain_note if not tx else f"matched_tx={tx.get('transaction_id')}",
+            )
+        if tx:
+            tx_hash = tx.get("transaction_id") or ""
+            paid_at = datetime.now(timezone.utc)
+            cur.execute(
+                "UPDATE qd_usdt_orders SET status = 'paid', tx_hash = ?, paid_at = ?, updated_at = NOW() "
+                "WHERE id = ? AND status IN ('pending','expired')",
+                (tx_hash, paid_at, order_id),
+            )
+            rc = getattr(cur, "rowcount", -1)
+            if rc == 0:
+                logger.warning(
+                    "USDT reconcile paid UPDATE skipped (0 rows) order_id=%s tx=%s DB status=%s",
+                    order_id,
+                    tx_hash,
+                    status,
+                )
+
+            # Try to confirm immediately if delay is satisfied
+            confirm_sec = int(cfg.get("confirm_seconds") or 30)
+            try:
+                tx_ts = tx.get("block_timestamp")
+                if tx_ts:
+                    tx_time = datetime.fromtimestamp(int(tx_ts) / 1000.0, tz=timezone.utc)
+                    if (now - tx_time).total_seconds() >= confirm_sec:
+                        self._confirm_and_activate_in_tx(cur, order_id, row.get("user_id"), row.get("plan"), tx_hash)
+                elif confirm_sec <= 0:
+                    self._confirm_and_activate_in_tx(cur, order_id, row.get("user_id"), row.get("plan"), tx_hash)
+            except Exception:
+                pass
             return
 
-        tx_hash = tx.get("transaction_id") or ""
-        paid_at = datetime.now(timezone.utc)
-        cur.execute(
-            "UPDATE qd_usdt_orders SET status = 'paid', tx_hash = ?, paid_at = ?, updated_at = NOW() WHERE id = ? AND status = 'pending'",
-            (tx_hash, paid_at, order_id),
-        )
-
-        # Try to confirm immediately if delay is satisfied
-        confirm_sec = int(cfg.get("confirm_seconds") or 30)
-        try:
-            tx_ts = tx.get("block_timestamp")
-            if tx_ts:
-                tx_time = datetime.fromtimestamp(int(tx_ts) / 1000.0, tz=timezone.utc)
-                if (now - tx_time).total_seconds() >= confirm_sec:
-                    self._confirm_and_activate_in_tx(cur, order_id, row.get("user_id"), row.get("plan"), tx_hash)
-            elif confirm_sec <= 0:
-                self._confirm_and_activate_in_tx(cur, order_id, row.get("user_id"), row.get("plan"), tx_hash)
-        except Exception:
-            pass
+        # No matching transfer yet: only pending orders can transition to expired
+        if status == "pending":
+            exp = self._coerce_utc_datetime(row.get("expires_at"))
+            if exp is not None and exp <= now:
+                cur.execute(
+                    "UPDATE qd_usdt_orders SET status = 'expired', updated_at = NOW() WHERE id = ? AND status = 'pending'",
+                    (order_id,),
+                )
+                if cfg.get("debug_reconcile_log"):
+                    logger.info(
+                        "USDT reconcile mark_expired order_id=%s user_id=%s (no matching transfer) chain_note=%s",
+                        order_id,
+                        row.get("user_id"),
+                        chain_note,
+                    )
 
     def _try_confirm_paid_order(self, cur, row: Dict[str, Any], cfg: Dict[str, Any], now: datetime) -> None:
         """For orders already in 'paid' status, check if confirm delay is met and activate."""
@@ -334,54 +394,121 @@ class UsdtPaymentService:
         except Exception as e:
             logger.error(f"USDT activate membership failed: order={order_id} err={e}", exc_info=True)
 
-    def _find_trc20_usdt_incoming(self, address: str, amount_usdt: Decimal, created_at: Optional[datetime]) -> Optional[Dict[str, Any]]:
+    def _find_trc20_usdt_incoming(
+        self, address: str, amount_usdt: Decimal, created_at: Optional[Any]
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """
+        Returns (transfer_dict_or_None, debug_note).
+        debug_note explains why no row matched (HTTP errors, empty list, filters).
+        """
         cfg = self._get_cfg()
         base = cfg["trongrid_base"]
         contract = cfg["usdt_trc20_contract"]
+        address = (address or "").strip()
+        page_limit = int(cfg.get("trongrid_page_limit") or 200)
+        max_pages = int(cfg.get("trongrid_max_pages") or 5)
 
         url = f"{base}/v1/accounts/{address}/transactions/trc20"
         headers = {}
         if cfg["trongrid_key"]:
             headers["TRON-PRO-API-KEY"] = cfg["trongrid_key"]
 
-        params = {
-            "only_to": "true",
-            "limit": 50,
-            "contract_address": contract,
-        }
+        def _parse_created_at(raw: Optional[Any]) -> Tuple[Optional[datetime], Optional[str]]:
+            if raw is None:
+                return None, None
+            if isinstance(raw, datetime):
+                return raw, None
+            if isinstance(raw, str):
+                try:
+                    return datetime.fromisoformat(raw.replace("Z", "+00:00")), None
+                except Exception as e:
+                    return None, f"created_at_unparsed:{type(raw).__name__}:{e}"
+            return None, f"created_at_unsupported_type:{type(raw).__name__}"
+
+        # TRC20 USDT has 6 decimals
+        target = int((amount_usdt * Decimal("1000000")).to_integral_value())
+
+        min_ts = None
+        created_warn = None
+        ct_parsed, warn = _parse_created_at(created_at)
+        created_warn = warn
+        if ct_parsed:
+            ct = ct_parsed
+            if ct.tzinfo is None:
+                ct = ct.replace(tzinfo=timezone.utc)
+            min_ts = int(ct.timestamp() * 1000) - 60_000
+
+        wrong_to = 0
+        before_order = 0
+        underpaid = 0
+        parse_err = 0
+        total_scanned = 0
+        pages_fetched = 0
+        fingerprint: Optional[str] = None
 
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
-            if resp.status_code != 200:
-                return None
-            data = resp.json() or {}
-            items = data.get("data") or []
-            # TRC20 USDT has 6 decimals
-            target = int((amount_usdt * Decimal("1000000")).to_integral_value())
+            for _ in range(max_pages):
+                params: Dict[str, Any] = {
+                    "only_to": "true",
+                    "limit": page_limit,
+                    "contract_address": contract,
+                    "only_confirmed": "true",
+                }
+                if fingerprint:
+                    params["fingerprint"] = fingerprint
 
-            min_ts = None
-            if created_at and isinstance(created_at, datetime):
-                ct = created_at
-                if ct.tzinfo is None:
-                    ct = ct.replace(tzinfo=timezone.utc)
-                min_ts = int(ct.timestamp() * 1000) - 60_000
+                resp = requests.get(url, params=params, headers=headers, timeout=15)
+                if resp.status_code != 200:
+                    body_head = (resp.text or "")[:200].replace("\n", " ")
+                    return None, f"trongrid_http={resp.status_code} body_head={body_head!r}"
 
-            for it in items:
-                try:
-                    if it.get("to") != address:
+                data = resp.json() or {}
+                items = data.get("data") or []
+                pages_fetched += 1
+                total_scanned += len(items)
+
+                for it in items:
+                    try:
+                        if (it.get("to") or "").strip() != address:
+                            wrong_to += 1
+                            continue
+                        bts = int(it.get("block_timestamp") or 0)
+                        if min_ts and bts < min_ts:
+                            before_order += 1
+                            continue
+                        val = int(it.get("value") or 0)
+                        if val < target:
+                            underpaid += 1
+                            continue
+                        return it, f"ok pages={pages_fetched} scanned={total_scanned}"
+                    except Exception:
+                        parse_err += 1
                         continue
-                    if min_ts and int(it.get("block_timestamp") or 0) < min_ts:
-                        continue
-                    val = int(it.get("value") or 0)
-                    # Accept payments >= order amount (tolerance for overpayment)
-                    if val < target:
-                        continue
-                    return it
-                except Exception:
-                    continue
-        except Exception:
-            return None
-        return None
+
+                meta = data.get("meta") or {}
+                fingerprint = meta.get("fingerprint") if isinstance(meta.get("fingerprint"), str) else None
+                if not fingerprint or len(items) < page_limit:
+                    break
+
+            parts = [
+                f"scanned_items={total_scanned}",
+                f"pages={pages_fetched}",
+                f"limit={page_limit}",
+                f"contract={contract}",
+                f"target_raw={target}",
+                f"min_ts={min_ts}",
+                f"wrong_to={wrong_to}",
+                f"before_order={before_order}",
+                f"underpaid={underpaid}",
+                f"parse_err={parse_err}",
+            ]
+            if created_warn:
+                parts.append(created_warn)
+            if total_scanned == 0:
+                parts.append("hint=no_rows_for_this_contract_or_address")
+            return None, "no_match " + " ".join(parts)
+        except Exception as e:
+            return None, f"trongrid_request_error:{type(e).__name__}:{e}"
 
     # -------------------- Batch refresh (for worker) --------------------
 
@@ -393,6 +520,7 @@ class UsdtPaymentService:
         Returns the number of orders that were updated to 'confirmed' or 'expired'.
         """
         updated = 0
+        cfg = self._get_cfg()
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -409,6 +537,12 @@ class UsdtPaymentService:
                     """
                 )
                 rows = cur.fetchall() or []
+                logger.info(
+                    "USDT reconcile batch start rows=%s debug_log=%s pay_enabled=%s",
+                    len(rows),
+                    cfg.get("debug_reconcile_log"),
+                    cfg.get("enabled"),
+                )
 
                 for row in rows:
                     old_status = (row.get("status") or "").lower()
@@ -452,6 +586,7 @@ class UsdtOrderWorker:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._pay_disabled_logged = False
 
     def start(self) -> bool:
         with self._lock:
@@ -481,6 +616,13 @@ class UsdtOrderWorker:
                     updated = svc.refresh_all_active_orders()
                     if updated > 0:
                         logger.info(f"UsdtOrderWorker: refreshed {updated} orders")
+                else:
+                    if not self._pay_disabled_logged:
+                        logger.info(
+                            "UsdtOrderWorker: USDT_PAY_ENABLED is false — worker runs but skips "
+                            "refresh_all_active_orders (set USDT_PAY_ENABLED=true to reconcile)."
+                        )
+                        self._pay_disabled_logged = True
             except Exception as e:
                 logger.error(f"UsdtOrderWorker loop error: {e}", exc_info=True)
 
