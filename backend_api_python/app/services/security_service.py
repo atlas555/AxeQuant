@@ -52,12 +52,17 @@ class SecurityService:
     
     def get_security_config(self) -> Dict[str, Any]:
         """Get public security config for frontend"""
+        mobile_ver = (os.getenv('MOBILE_APP_LATEST_VERSION') or '').strip()
+        mobile_url = (os.getenv('MOBILE_APP_DOWNLOAD_URL') or '').strip() or 'https://www.quantdinger.com/download/app.apk'
         return {
             'turnstile_enabled': self.turnstile_enabled,
             'turnstile_site_key': self.turnstile_site_key,
             'registration_enabled': os.getenv('ENABLE_REGISTRATION', 'true').lower() == 'true',
             'oauth_google_enabled': bool(os.getenv('GOOGLE_CLIENT_ID', '')),
             'oauth_github_enabled': bool(os.getenv('GITHUB_CLIENT_ID', '')),
+            # Mobile in-app version check (semver-ish string, e.g. 1.0.1)
+            'mobile_app_latest_version': mobile_ver,
+            'mobile_app_download_url': mobile_url,
         }
     
     # =========================================================================
