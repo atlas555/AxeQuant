@@ -197,6 +197,24 @@ class BinanceSpotClient(BaseRestClient):
             return prefix[:36]
         return f"{prefix}{raw[:suffix_budget]}"
 
+    def _hint_binance_spot_2015(self, text: str) -> str:
+        """
+        Binance -2015 is vague; expand common root causes for operators.
+        This path uses **spot** REST (api.binance.com or demo-api.binance.com), not futures fapi.
+        """
+        t = str(text or "")
+        if "-2015" not in t:
+            return ""
+        host = (getattr(self, "base_url", None) or "").replace("https://", "").strip("/") or "?"
+        return (
+            f" | hint[-2015 host={host}]: "
+            "确认 API 为**现货**权限(需勾选「允许现货及杠杆交易」/Enable Spot & Margin Trading)，"
+            "仅有合约权限会失败；"
+            "若凭证开启 Demo/模拟，密钥须来自演示环境且请求 demo-api.binance.com；"
+            "IP 白名单填**本服务出站公网 IP**(Docker/云主机出口，非本机宽带)；"
+            "核对 Key/Secret 无多余空格且与币安控制台一致。"
+        )
+
     def _signed_request(self, method: str, path: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
         self._ensure_server_time()
         last_err: Optional[LiveTradingError] = None
@@ -209,14 +227,17 @@ class BinanceSpotClient(BaseRestClient):
             p["signature"] = self._sign(qs)
             code, data, text = self._request(method, path, params=p, headers=self._signed_headers())
             if code >= 400:
-                err = LiveTradingError(f"BinanceSpot HTTP {code}: {text[:500]}")
+                err = LiveTradingError(
+                    f"BinanceSpot HTTP {code}: {text[:500]}{self._hint_binance_spot_2015(text)}"
+                )
                 if attempt == 0 and ("-1021" in text or "1021" in text):
                     self._ensure_server_time(force=True)
                     last_err = err
                     continue
                 raise err
             if isinstance(data, dict) and data.get("code") and int(data.get("code")) < 0:
-                err = LiveTradingError(f"BinanceSpot error: {data}")
+                err_txt = str(data)
+                err = LiveTradingError(f"BinanceSpot error: {data}{self._hint_binance_spot_2015(err_txt)}")
                 if attempt == 0 and int(data.get("code") or 0) == -1021:
                     self._ensure_server_time(force=True)
                     last_err = err
