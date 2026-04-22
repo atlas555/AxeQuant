@@ -13,6 +13,7 @@ from app.services.backtest import BacktestService
 from app.utils.logger import get_logger
 from app.utils.db import get_db_connection
 from app.utils.auth import login_required
+from app.utils.safe_exec import validate_code_safety
 import requests
 
 logger = get_logger(__name__)
@@ -174,6 +175,13 @@ def run_backtest():
         # Extract params - use current user's ID
         user_id = g.user_id
         indicator_code = data.get('indicatorCode', '')
+        is_safe_code, unsafe_reason = validate_code_safety(indicator_code or '')
+        if not is_safe_code:
+            return jsonify({
+                'code': 0,
+                'msg': f'Unsafe indicator code: {unsafe_reason}',
+                'data': None
+            }), 400
         indicator_id = data.get('indicatorId')
         symbol = data.get('symbol', '')
         market = data.get('market', '')
