@@ -11,6 +11,17 @@ list; after merging, verify each patch still applies cleanly.
 
 ---
 
+## backend_api_python/app/__init__.py
+
+- **Upstream commit at patch time:** `65d8f1a` (2026-04-23)
+- **Lines added:** +8 after the existing `register_routes(app)` call in `create_app()`
+- **What:** import and call `register_research_blueprint(app)`, wrapped in try/except so plugin errors never block upstream boot
+- **Why:** wires `/api/research/*` routes into the Flask app for Phases 2-5 (defense, autoresearch, paper, live)
+- **Removal:** delete the patch block; blueprint becomes dead code (also delete `app/routes/research.py` if desired)
+- **Risk on upstream merge:** low — the patch follows an existing `register_routes` call and is try/except-guarded
+
+---
+
 ## backend_api_python/app/services/strategy_script_runtime.py
 
 - **Upstream commit at patch time:** `65d8f1a` (2026-04-23)

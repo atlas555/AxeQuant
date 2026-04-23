@@ -243,6 +243,14 @@ def create_app(config_name='default'):
 
     from app.routes import register_routes
     register_routes(app)
+
+    # AxeQuant patch: register /api/research/* blueprint for defense /
+    # autoresearch / paper / live endpoints.
+    try:
+        from app.routes.research import register_research_blueprint
+        register_research_blueprint(app)
+    except Exception as _e:  # noqa: BLE001 — never block app boot on plugin
+        logger.warning(f"AxeQuant research blueprint not registered: {_e}")
     
     # Startup hooks.
     with app.app_context():
