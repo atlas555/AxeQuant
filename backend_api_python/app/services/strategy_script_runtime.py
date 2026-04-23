@@ -124,6 +124,11 @@ class StrategyScriptContext:
         self.balance = float(initial_balance)
         self.equity = float(initial_balance)
 
+        # AxeQuant patch: expose backTestSys signals via ctx.signal(name, **params).
+        # See UPSTREAM_PATCHES.md and backtestsys_plugin/adapters/ctx_signals.py.
+        from app.services.backtestsys_plugin.adapters.ctx_signals import attach_signals
+        attach_signals(self)
+
     def param(self, name: str, default: Any = None) -> Any:
         if name not in self._params:
             self._params[name] = default
